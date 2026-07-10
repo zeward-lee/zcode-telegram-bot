@@ -86,6 +86,7 @@ class ZCodeTelegramBot:
         app.add_handler(CommandHandler("sessions", self.cmd_sessions))
         app.add_handler(CommandHandler("sync", self.cmd_sync))
         app.add_handler(CommandHandler("model", self.cmd_model))
+        app.add_handler(CommandHandler("stop", self.cmd_stop))
         app.add_handler(CallbackQueryHandler(self.on_session_pick, pattern="^sync:"))
         app.add_handler(CallbackQueryHandler(self.on_permission_decision, pattern="^perm:"))
         app.add_handler(CallbackQueryHandler(self.on_cancel, pattern="^cancel:"))
@@ -255,6 +256,7 @@ class ZCodeTelegramBot:
             "/sessions — 列出本地 TUI session,选一个关联(双向同步)\n"
             "/sync <sessionId> — 直接关联指定 session\n"
             "/model — 查看/切换当前会话模型\n"
+            "/stop — 停止当前正在跑的任务\n"
             "/id — 查看你的 Telegram user id"
         )
 
@@ -706,6 +708,16 @@ class ZCodeTelegramBot:
         except asyncio.TimeoutError:
             await ctx_safe_edit(chat_id, placeholder.message_id, "❌ 等待回复超时。")
             return
+        except asyncio.CancelledError:
+            # 用户 /stop 或点取消:把占位改成"已停止"并释放锁
+            try:
+                await ctx_safe_edit(
+                    chat_id, placeholder.message_id, "🚫 已停止。",
+                    reply_markup=InlineKeyboardMarkup([]),
+                )
+            except Exception:
+                pass
+            raise
         except AppServerError as e:
             await ctx_safe_edit(chat_id, placeholder.message_id, f"❌ {e}")
             return
@@ -891,17 +903,34 @@ class ZCodeTelegramBot:
         # 先 resolve 所有 pending permission 为 deny(共用 _resolve_perm)
         for rid in list(self._perm_futures.keys()):
             await self._resolve_perm(rid, "deny", "用户取消了整个 turn")
-        # 编辑占位消息提示(按钮也去掉)
-        try:
-            await ctx_safe_edit(
-                query.message.chat_id, query.message.message_id,
-                "🚫 已取消。",
-                reply_markup=InlineKeyboardMarkup([]),
-            )
-        except Exception:
-            pass
+        # 占位的提示文案统一由 _run_app_server_turn 的 CancelledError 分支处理
         task.cancel()
         logger.info("用户取消 turn(sessionId=%s)", sid)
+
+    async def cmd_stop(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """停止当前话题/会话正在跑的任务(/stop)。
+
+        跟占位上的"🚫 取消"按钮等价:先 resolve pending permission,
+        再 cancel turn 的 Task。占位消息由 _run_app_server_turn 的 CancelledError
+        分支 edit 成"已停止"。
+        """
+        if not self._is_allowed(update):
+            return
+        key = self._session_key(update)
+        sid = self.store.get(key)
+        if not sid:
+            await update.message.reply_text("❓ 当前没有会话。")
+            return
+        task = self._running_turns.get(sid)
+        if not task or task.done():
+            await update.message.reply_text("💤 当前没有在跑的任务。")
+            return
+        # 先 resolve pending permission(否则 ZCode 那边 permission 永等)
+        for rid in list(self._perm_futures.keys()):
+            await self._resolve_perm(rid, "deny", "用户停止了任务")
+        task.cancel()
+        await update.message.reply_text("🚫 已停止当前任务。")
+        logger.info("用户停止 turn(sessionId=%s)", sid)
 
     async def cmd_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """查看/切换当前会话模型:列出可用模型按钮,点选切换。"""
@@ -932,8 +961,13 @@ class ZCodeTelegramBot:
         items = []
         for m in models:
             ref = m.get("ref", {})
-            items.append((ref.get("providerId", ""), ref.get("modelId", ""),
-                          m.get("label", "") or f"{ref.get('providerId','')}/{ref.get('modelId','')}"))
+            pid = ref.get("providerId", "")
+            mid = ref.get("modelId", "")
+            plabel = m.get("providerLabel", "") or pid[:8]
+            mlabel = m.get("label", "") or mid
+            # 按钮文案:代理商名/模型名(区分同模型不同 provider)
+            display = f"{plabel} · {mlabel}"
+            items.append((pid, mid, display))
         self._model_lists[key] = items
         # 渲染键盘
         keyboard = []
