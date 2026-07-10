@@ -65,6 +65,7 @@ class Config:
     app_server_turn_timeout: float  # 单个 turn 最长等待秒数
     session_mode: str  # ZCode 权限模式:build(写操作需审批)/ yolo(全自动)/ plan / edit
     stream_edit_interval: float  # 流式输出时同条消息 edit 的最小间隔(秒,太小易触发 Telegram 429)
+    perm_timeout: float  # build 模式下审批按钮等待超时(秒),超时按"拒绝"兜底,避免 session 锁死
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -98,6 +99,7 @@ class Config:
             app_server_turn_timeout=float(os.environ.get("APP_SERVER_TURN_TIMEOUT", "600")),
             session_mode=os.environ.get("SESSION_MODE", "build"),
             stream_edit_interval=float(os.environ.get("STREAM_EDIT_INTERVAL", "2.0")),
+            perm_timeout=float(os.environ.get("PERM_TIMEOUT", "120")),
         )
 
     @property

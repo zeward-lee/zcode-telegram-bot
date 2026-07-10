@@ -18,6 +18,7 @@ from typing import AsyncIterator, Callable, Optional
 from app_server_client import (
     AppServerClient,
     AppServerError,
+    AppServerUnavailableError,
     SessionUnavailableError,
     StreamEvent,
 )
@@ -55,9 +56,25 @@ class SessionSync:
     ) -> None:
         self.client = client
         self.poll_interval = poll_interval
-        # session_id → watcher 状态
-        self._watchers: dict[str, _Watcher] = {}
+        # session_id → watcher 列表(同 session 多个 key 共享时,各自回调不覆盖)
+        self._watchers: dict[str, list[_Watcher]] = {}
         self._poll_task: Optional[asyncio.Task] = None
+        # app-server 崩溃时暂停轮询(set 时 _poll_loop 停下,clear 时恢复)
+        self._paused = asyncio.Event()
+        self._crash_logged = False  # 避免每 1.5s 刷同一条 warning
+
+    def pause(self) -> None:
+        """app-server 不可用时暂停轮询(避免撞墙刷日志)。"""
+        if not self._paused.is_set():
+            logger.warning("app-server 不可用,轮询暂停")
+        self._paused.set()
+
+    def resume(self) -> None:
+        """app-server 恢复后恢复轮询。"""
+        if self._paused.is_set():
+            logger.info("app-server 恢复,轮询继续")
+        self._paused.clear()
+        self._crash_logged = False
 
     async def start(self) -> None:
         """启动后台轮询协程。幂等。"""
@@ -91,12 +108,12 @@ class SessionSync:
 
         调用方据此增量渲染(收到 model.streaming 更新文本,turn.completed 收尾)。
 
-        期间会静音该 session 的轮询 watcher,避免 bot 自己发的消息
+        期间会静音该 session 的所有轮询 watcher,避免 bot 自己发的消息
         被轮询当成"TUI 活动"重复推送(回环)。结束后把水位跳到最新 seq。
         """
-        watcher = self._watchers.get(session_id)
-        if watcher:
-            watcher.muted = True  # 静音:发送期间不推送
+        watchers = self._watchers.get(session_id, [])
+        for w in watchers:
+            w.muted = True  # 静音:发送期间不推送
         last_seq = 0
         try:
             async for ev in self.client.send_and_stream(
@@ -106,9 +123,9 @@ class SessionSync:
                 yield ev
         finally:
             # 恢复监听,但把水位跳到自己产生的事件之后(避免回环)
-            if watcher:
-                watcher.last_seq = max(watcher.last_seq, last_seq)
-                watcher.muted = False
+            for w in watchers:
+                w.last_seq = max(w.last_seq, last_seq)
+                w.muted = False
 
     async def send_collect(
         self,
@@ -150,34 +167,45 @@ class SessionSync:
     ) -> None:
         """开始监视一个 session:TUI 在该 session 上的新活动会回调 on_events。
 
+        同 session 可被多个 key 共享(群共享),各自 on_events 追加进列表,
+        互不覆盖。last_seq 取已有 watcher 的最大值(水位只升不降)。
+
         Args:
             session_id: 要监视的 session(需已 resume + subscribe 过)
             last_seq: 当前已知的水位 seq(只推送 > last_seq 的事件)
             on_events: 回调 (session_id, new_events);在 loop 线程同步执行
         """
-        self._watchers[session_id] = _Watcher(
-            session_id=session_id,
-            last_seq=last_seq,
-            on_events=on_events,
-        )
-        logger.info("开始监视 session %s (from seq=%d)", session_id, last_seq)
+        lst = self._watchers.setdefault(session_id, [])
+        # 已有 watcher 的话,水位取最大(避免后注册的把水位拉低)
+        seq = last_seq
+        for w in lst:
+            seq = max(seq, w.last_seq)
+        lst.append(_Watcher(session_id=session_id, last_seq=seq, on_events=on_events))
+        logger.info("开始监视 session %s (from seq=%d, 共 %d 个 watcher)", session_id, seq, len(lst))
 
     def unwatch(self, session_id: str) -> None:
-        """停止监视某 session。"""
+        """停止监视某 session 的所有 watcher。"""
         if self._watchers.pop(session_id, None):
             logger.info("停止监视 session %s", session_id)
 
     def get_last_seq(self, session_id: str) -> Optional[int]:
-        """取某 session 当前的轮询水位(供持久化)。"""
-        w = self._watchers.get(session_id)
-        return w.last_seq if w else None
+        """取某 session 当前的轮询水位(供持久化,取所有 watcher 的最大值)。"""
+        lst = self._watchers.get(session_id)
+        if not lst:
+            return None
+        return max(w.last_seq for w in lst)
 
     async def _poll_loop(self) -> None:
         """后台轮询:对每个 watcher 调 get_events,有新事件就回调。"""
         while True:
             try:
+                # app-server 崩溃时暂停,等恢复
+                if self._paused.is_set():
+                    await self._paused.wait()
                 await asyncio.sleep(self.poll_interval)
-                for sid, watcher in list(self._watchers.items()):
+                # 展平所有 watcher(session_id 可被多 key 共享,各自独立轮询)
+                flat = [w for ws in self._watchers.values() for w in ws]
+                for watcher in flat:
                     await self._poll_one(watcher)
             except asyncio.CancelledError:
                 break
@@ -197,6 +225,10 @@ class SessionSync:
             # session 被关闭了,停止监视
             logger.warning("轮询的 session %s 已不可用,停止监视", watcher.session_id)
             self._watchers.pop(watcher.session_id, None)
+            return
+        except AppServerUnavailableError:
+            # app-server 进程崩了:暂停轮询,保留 watcher 等恢复(不 pop)
+            self.pause()
             return
         except AppServerError as e:
             logger.warning("轮询 session %s 出错: %s", watcher.session_id, e)

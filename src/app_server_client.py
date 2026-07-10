@@ -23,7 +23,7 @@ import logging
 import subprocess
 import threading
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Callable, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 from zcode_client import find_zcode_cli
 
@@ -114,6 +114,12 @@ class AppServerClient:
         self._perm_pending: dict[str, Any] = {}
         # _perm_cache: requestId → 已缓存的 decision 结果(审批完成后,后续重发直接回)
         self._perm_cache: dict[str, dict] = {}
+        # 崩溃自愈:app-server 子进程退出时调这个回调通知上层(bot 清 perm/cancel turn,
+        # sync 暂停轮询)。上层在 post_init 里设置。
+        self.on_unavailable: Optional[Callable[[], Awaitable[None]]] = None
+        self.on_recovered: Optional[Callable[[], Awaitable[None]]] = None
+        self._restart_count = 0
+        self._restart_max = 5  # 最多重试 5 次(指数退避 2/4/8/16/30s),超限放弃
 
     # ---------- 生命周期 ----------
 
@@ -149,6 +155,12 @@ class AppServerClient:
             ).start()
             # 启动 loop 侧的行分发协程
             asyncio.ensure_future(self._dispatch_loop())
+            # 通知上层 app-server 就绪(首次启动 + 崩溃重启都触发;sync.resume 幂等)
+            if self.on_recovered:
+                try:
+                    await self.on_recovered()
+                except Exception:
+                    logger.exception("on_recovered 回调异常")
 
     def _build_args(self) -> list[str]:
         cli = self.cli_path
@@ -201,13 +213,58 @@ class AppServerClient:
                         )
                 self._pending.clear()
                 self._started = False
-                break
+                # 通知上层(bot 清 perm/cancel turn,sync 暂停轮询)
+                if self.on_unavailable:
+                    try:
+                        await self.on_unavailable()
+                    except Exception:
+                        logger.exception("on_unavailable 回调异常")
+                # 指数退避重启子进程(最多 _restart_max 次)
+                await self._recover()
+                # 重启成功后重新进入分发循环(新 dispatch_loop 由 start 启动)
+                # _recover 成功会再 ensure_future(_dispatch_loop),这里直接退出避免重复
+                return
             try:
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 logger.warning("app-server 非 JSON 行: %s", line[:200])
                 continue
             self._handle_message(msg)
+
+    async def _recover(self) -> None:
+        """app-server 崩溃后指数退避重启。超限放弃,让上层超时路径兜底。"""
+        backoffs = [2, 4, 8, 16, 30]
+        for i in range(self._restart_max):
+            wait = backoffs[min(i, len(backoffs) - 1)]
+            logger.warning(
+                "app-server 已退出,%ds 后重启(第 %d/%d 次)", wait, i + 1, self._restart_max
+            )
+            await asyncio.sleep(wait)
+            # 清理旧子进程句柄 + 残留 permission 状态
+            await self._cleanup_dead_proc()
+            self._perm_pending.clear()
+            self._perm_cache.clear()
+            try:
+                await self.start()
+                self._restart_count = 0
+                logger.info("app-server 重启成功")
+                return
+            except Exception:
+                logger.exception("app-server 重启失败(第 %d 次)", i + 1)
+        logger.error("app-server 重启超 %d 次放弃,需人工介入", self._restart_max)
+
+    async def _cleanup_dead_proc(self) -> None:
+        """释放已死子进程的句柄(Windows 上 Popen 不 wait 会泄漏)。"""
+        proc = self._proc
+        if proc:
+            try:
+                proc.wait(timeout=1)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._proc = None
 
     def _handle_message(self, msg: dict) -> None:
         """分发单条消息:响应按 id 匹配 future,通知交给 handlers。"""

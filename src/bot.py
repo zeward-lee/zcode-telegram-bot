@@ -65,6 +65,8 @@ class ZCodeTelegramBot:
         self._bot_username: str = ""
         # permission 审批:request_id → asyncio.Future(用户点按钮时 set_result)
         self._perm_futures: dict[str, asyncio.Future] = {}
+        # 正在跑的 turn:session_id → asyncio.Task(供 /cancel 取消)
+        self._running_turns: dict[str, asyncio.Task] = {}
 
     # ---------- 应用装配 ----------
 
@@ -83,6 +85,7 @@ class ZCodeTelegramBot:
         app.add_handler(CommandHandler("sync", self.cmd_sync))
         app.add_handler(CallbackQueryHandler(self.on_session_pick, pattern="^sync:"))
         app.add_handler(CallbackQueryHandler(self.on_permission_decision, pattern="^perm:"))
+        app.add_handler(CallbackQueryHandler(self.on_cancel, pattern="^cancel:"))
         app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_message)
         )
@@ -93,10 +96,33 @@ class ZCodeTelegramBot:
         if self.config.use_app_server:
             client = AppServerClient(cwd=self.config.workspace_path)
             self.sync = SessionSync(client, poll_interval=self.config.poll_interval)
+            # 崩溃自愈钩子:app-server 退出时清 perm/cancel turn/暂停轮询,
+            # 重启成功后恢复轮询。
+            client.on_unavailable = self._on_appserver_unavailable
+            client.on_recovered = self._on_appserver_recovered
             await self.sync.start()
+            # 重启后 resume 已存 session 的 watcher(D)
+            await self._resume_persisted_sessions()
             logger.info("✅ app-server 同步层已就绪")
         else:
             logger.info("ℹ️ USE_APP_SERVER=0,使用 --prompt 回退模式")
+
+    async def _on_appserver_unavailable(self) -> None:
+        """app-server 崩溃时:暂停轮询 + 清 perm + cancel 所有 turn,避免死锁。"""
+        if self.sync:
+            self.sync.pause()
+        # 所有 pending permission 按 deny resolve(解锁卡在 await fut 的 turn)
+        for rid in list(self._perm_futures.keys()):
+            await self._resolve_perm(rid, "deny", "app-server 重启")
+        # cancel 所有正在跑的 turn(清理僵尸 handler,释放 session 锁)
+        for sid, task in list(self._running_turns.items()):
+            if not task.done():
+                task.cancel()
+
+    async def _on_appserver_recovered(self) -> None:
+        """app-server 重启成功后:恢复轮询。"""
+        if self.sync:
+            self.sync.resume()
 
     async def on_shutdown(self, application: Application) -> None:
         if self.sync:
@@ -165,6 +191,44 @@ class ZCodeTelegramBot:
             thread_id = None
         key = self._session_key(update)
         self._push_targets[key] = (msg.chat_id, thread_id)
+        # 持久化推送目标,重启 resume 后 TUI→bot 推送能立即用
+        self.store.set_push_target(key, msg.chat_id, thread_id)
+
+    async def _resume_persisted_sessions(self) -> None:
+        """重启后恢复所有已存 session 的 watcher + 推送目标。
+
+        bot 重启后 _watchers/_push_targets 内存全丢,但 sessions.json 还在。
+        遍历它 resume+subscribe+建 watcher,让 TUI→bot 推送不哑火。
+        失效的 session(session 表里已删/归档)静默清掉 store 这条。
+        """
+        if not self.sync:
+            return
+        entries = self.store.iter_all()
+        seen_sids: set[str] = set()  # 同 sid 多 key 只 resume/subscribe 一次
+        for key, entry in entries:
+            sid = entry.get("session_id")
+            if not sid or sid in seen_sids:
+                continue
+            seen_sids.add(sid)
+            try:
+                last_seq = entry.get("last_seq", 0)
+                await self.sync.client.resume_session(sid)
+                await self.sync.client.subscribe(sid, after_seq=last_seq)
+            except Exception:
+                logger.warning("重启恢复 session %s 失败,清理该 key", sid[:24])
+                self.store.reset(key)
+                continue
+            logger.info("已恢复 session %s 的监听", sid[:24])
+        # 为每个 key 重建 _push_targets(从持久化的 chat_id/thread_id)
+        for key, entry in self.store.iter_all():
+            chat_id = entry.get("chat_id")
+            if chat_id:
+                self._push_targets[key] = (chat_id, entry.get("thread_id"))
+            # 重建 watcher(用最新水位)
+            sid = entry.get("session_id")
+            if sid and sid in seen_sids:
+                last_seq = entry.get("last_seq", 0)
+                self._setup_watch(key, sid)
 
     def _get_session_lock(self, session_id: str) -> asyncio.Lock:
         """取/建 per-session 的异步锁(群组共享 session 时排队用)。"""
@@ -499,7 +563,13 @@ class ZCodeTelegramBot:
             # 已有人在跑,提示排队
             await update.message.reply_text("⏳ 前面有任务在跑,排队中…")
         async with lock:
-            await self._run_app_server_turn(update, session_id, prompt)
+            # 把 turn 包成独立 Task,供 /cancel 取消(同 session 串行,同时只有一个)
+            task = asyncio.ensure_future(self._run_app_server_turn(update, session_id, prompt))
+            self._running_turns[session_id] = task
+            try:
+                await task
+            finally:
+                self._running_turns.pop(session_id, None)
 
     async def _run_app_server_turn(
         self, update: Update, session_id: str, prompt: str
@@ -523,6 +593,10 @@ class ZCodeTelegramBot:
         error = None
         edit_interval = self.config.stream_edit_interval
         app = _bot_ref.get("app")
+        # 占位消息上挂"取消"按钮(callback_data < 64 字节)
+        cancel_markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🚫 取消", callback_data=f"cancel:{session_id}")]]
+        )
 
         async def _refresh_typing() -> None:
             """续 typing 指示器(过期 5s,这里 4s 续一次)。"""
@@ -559,6 +633,7 @@ class ZCodeTelegramBot:
                                 await ctx_safe_edit(
                                     chat_id, placeholder.message_id,
                                     _truncate(accumulated, self.config.max_message_length - 8),
+                                    reply_markup=cancel_markup,
                                 )
                                 last_edit = now
                             except Exception:
@@ -620,10 +695,11 @@ class ZCodeTelegramBot:
             return
 
         if len(final_text) + len(footer) <= max_single:
-            # 短文本:直接 edit 占位成最终结果
+            # 短文本:直接 edit 占位成最终结果(去掉取消按钮)
             try:
                 await ctx_safe_edit(
-                    chat_id, placeholder.message_id, final_text + footer
+                    chat_id, placeholder.message_id, final_text + footer,
+                    reply_markup=InlineKeyboardMarkup([]),
                 )
                 return
             except Exception:
@@ -674,24 +750,60 @@ class ZCodeTelegramBot:
             f"{detail}"
         )
         app = _bot_ref.get("app")
+        perm_msg = None
         if app and app.bot:
             # 论坛群:审批消息要落到当前话题,否则掉到 General
             thread_id = _thread_id_of(update)
-            await app.bot.send_message(
+            perm_msg = await app.bot.send_message(
                 chat_id=chat_id, text=msg_text, message_thread_id=thread_id,
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
 
-        # 等用户决策(不超时,符合需求)
-        decision = await fut
+        # 等用户决策:有超时兜底(防用户不点导致 session 锁死)
+        # 超时/取消都按 deny 处理(安全侧偏保守),deny 后 ZCode 会推 turn.completed
+        try:
+            decision = await asyncio.wait_for(fut, timeout=self.config.perm_timeout)
+        except asyncio.TimeoutError:
+            logger.warning("permission 审批超时(requestId=%s),按拒绝兜底", request_id)
+            await self._resolve_perm(request_id, "deny", "审批超时")
+            # 编辑审批消息为"超时已拒绝"(按钮点按的 edit 由 on_permission_decision 处理)
+            if perm_msg:
+                try:
+                    await perm_msg.edit_text(
+                        f"{msg_text}\n\n→ ⏱ 超时已拒绝",
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+            # 让控制流回到 async for:deny 后 ZCode 继续推进 turn
+            return
+        # 正常路径:缓存结果 + 取最新 rid(reannounce 可能更新过)
+        await self._resolve_perm(request_id, decision)
+        logger.info("permission 审批完成(requestId=%s → %s)", request_id, decision)
+
+    async def _resolve_perm(
+        self, request_id: str, decision: str, reason: str = ""
+    ) -> None:
+        """统一处理 permission 决策:resolve future + respond ZCode + edit 审批消息。
+
+        用 pop 保证只 resolve 一次(防超时与按钮点按竞争导致重复 respond)。
+        被 _handle_permission_event(正常/超时)和 on_cancel(取消整个 turn)共用。
+        """
+        assert self.sync
+        fut = self._perm_futures.pop(request_id, None)
+        if fut and not fut.done():
+            fut.set_result(decision)
         # 缓存结果 + 取最新 rid(reannounce 可能更新过)
         rid = self.sync.client.remember_perm_decision(request_id, decision)
-        # 回应 ZCode
-        result = {"decision": decision}
+        result: dict = {"decision": decision}
         if decision == "deny":
-            result["reason"] = "用户在 Telegram 拒绝了该操作"
-        await self.sync.client.respond(rid, result)
-        logger.info("permission 审批完成(requestId=%s → %s)", request_id, decision)
+            result["reason"] = reason or "用户在 Telegram 拒绝了该操作"
+        elif reason:
+            result["reason"] = reason
+        try:
+            await self.sync.client.respond(rid, result)
+        except Exception:
+            logger.exception("respond permission 失败(requestId=%s)", request_id)
 
     async def on_permission_decision(
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
@@ -716,6 +828,41 @@ class ZCodeTelegramBot:
             await query.edit_message_text(f"{query.message.text}\n\n→ {label}")
         else:
             await query.edit_message_text("⚠️ 该审批已处理或已过期。")
+
+    async def on_cancel(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """占位消息上"🚫 取消"按钮回调:取消正在跑的 turn。
+
+        先把该 turn 所有 pending permission 按 deny resolve(否则 ZCode 那边
+        permission 永等),再 cancel turn 的 Task。协议层无 turn.cancel,app-server
+        那边 turn 照跑完,但 bot 侧停止渲染 + 释放 session 锁。
+        """
+        query = update.callback_query
+        await query.answer()
+        if not self._is_allowed(update):
+            await query.edit_message_text("🔒 无权操作。")
+            return
+        # 解析 callback_data: cancel:<session_id>
+        sid = query.data.split(":", 1)[1] if ":" in query.data else ""
+        task = self._running_turns.get(sid)
+        if not task or task.done():
+            await query.edit_message_text("⚠️ 该任务已结束,无需取消。")
+            return
+        # 先 resolve 所有 pending permission 为 deny(共用 _resolve_perm)
+        for rid in list(self._perm_futures.keys()):
+            await self._resolve_perm(rid, "deny", "用户取消了整个 turn")
+        # 编辑占位消息提示(按钮也去掉)
+        try:
+            await ctx_safe_edit(
+                query.message.chat_id, query.message.message_id,
+                "🚫 已取消。",
+                reply_markup=InlineKeyboardMarkup([]),
+            )
+        except Exception:
+            pass
+        task.cancel()
+        logger.info("用户取消 turn(sessionId=%s)", sid)
 
     async def _handle_prompt_mode(
         self, update: Update, key: int, prompt: str
@@ -796,10 +943,17 @@ async def ctx_safe_send(
         )
 
 
-async def ctx_safe_edit(chat_id: int, message_id: int, text: str) -> None:
+async def ctx_safe_edit(
+    chat_id: int,
+    message_id: int,
+    text: str,
+    reply_markup=None,
+) -> None:
     app = _bot_ref.get("app")
     if app and app.bot:
-        await app.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+        await app.bot.edit_message_text(
+            chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup
+        )
 
 
 async def ctx_safe_delete(chat_id: int, message_id: int) -> None:

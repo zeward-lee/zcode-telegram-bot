@@ -58,7 +58,7 @@ class SessionStore:
             return entry["session_id"] if entry else None
 
     def set(self, key: str, session_id: str) -> None:
-        """设置/更新某 key 的 sessionId(保留已有 last_seq)。"""
+        """设置/更新某 key 的 sessionId(保留已有 last_seq/push_target)。"""
         with self._lock:
             existing = self._data.get(key, {})
             self._data[key] = {
@@ -67,9 +67,30 @@ class SessionStore:
                 "delivery_kind": existing.get(
                     "delivery_kind", "web-remote-replayable"
                 ),
+                # 持久化推送目标(重启 resume 后 TUI→bot 推送能立即用,不丢)
+                "chat_id": existing.get("chat_id"),
+                "thread_id": existing.get("thread_id"),
                 "updated_at": int(time.time()),
             }
             self._save()
+
+    def set_push_target(
+        self, key: str, chat_id: int, thread_id: Optional[int]
+    ) -> None:
+        """记录推送目标(chat_id + 话题 thread_id),重启后 resume 能恢复推送。"""
+        with self._lock:
+            entry = self._data.get(key)
+            if not entry:
+                return  # 没绑 session,不存孤立目标
+            entry["chat_id"] = chat_id
+            entry["thread_id"] = thread_id
+            entry["updated_at"] = int(time.time())
+            self._save()
+
+    def iter_all(self) -> list[tuple[str, dict]]:
+        """返回所有 (key, entry) 副本,供重启时 resume 已存 session 的 watcher。"""
+        with self._lock:
+            return [(k, dict(v)) for k, v in self._data.items()]
 
     def get_last_seq(self, key: str) -> int:
         """取某 key session 的轮询水位 seq(默认 0)。"""
