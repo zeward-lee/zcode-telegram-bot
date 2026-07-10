@@ -1,9 +1,10 @@
-"""会话持久化 —— 每个 Telegram 用户绑定一个 ZCode sessionId。
+"""会话持久化 —— 每个 session key 绑定一个 ZCode sessionId。
 
-存储 (user_id, session_id) 映射到 JSON 文件,重启不丢。
+存储 (key, session_id) 映射到 JSON 文件,重启不丢。
+key 可以是 user_id(私聊)、chat_id(普通群)、或 "chat_id:thread_id"(论坛话题)。
 支持:
 - get / set / reset
-- LRU 淘汰(每用户会话数上限)
+- LRU 淘汰(每 key 会话数上限)
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ class SessionStore:
 
     数据结构(JSON 文件):
         {
-          "123456789": {
+          "123456789": {                # key:str(user_id) 或 str(chat_id) 或 "chat_id:thread_id"
             "session_id": "sess_xxx",
             "last_seq": 42,              # 轮询水位(app-server 协议 seq)
             "delivery_kind": "web-remote-replayable",
@@ -50,17 +51,17 @@ class SessionStore:
         )
         tmp.replace(self._path)
 
-    def get(self, user_id: int) -> Optional[str]:
-        """取某用户当前的 sessionId,没有则返回 None。"""
+    def get(self, key: str) -> Optional[str]:
+        """取某 key 当前的 sessionId,没有则返回 None。"""
         with self._lock:
-            entry = self._data.get(str(user_id))
+            entry = self._data.get(key)
             return entry["session_id"] if entry else None
 
-    def set(self, user_id: int, session_id: str) -> None:
-        """设置/更新某用户的 sessionId(保留已有 last_seq)。"""
+    def set(self, key: str, session_id: str) -> None:
+        """设置/更新某 key 的 sessionId(保留已有 last_seq)。"""
         with self._lock:
-            existing = self._data.get(str(user_id), {})
-            self._data[str(user_id)] = {
+            existing = self._data.get(key, {})
+            self._data[key] = {
                 "session_id": session_id,
                 "last_seq": existing.get("last_seq", 0),
                 "delivery_kind": existing.get(
@@ -70,24 +71,24 @@ class SessionStore:
             }
             self._save()
 
-    def get_last_seq(self, user_id: int) -> int:
-        """取某用户 session 的轮询水位 seq(默认 0)。"""
+    def get_last_seq(self, key: str) -> int:
+        """取某 key session 的轮询水位 seq(默认 0)。"""
         with self._lock:
-            entry = self._data.get(str(user_id))
+            entry = self._data.get(key)
             return entry.get("last_seq", 0) if entry else 0
 
-    def set_last_seq(self, user_id: int, seq: int) -> None:
-        """更新某用户的轮询水位(重启后续传,不重复推送)。"""
+    def set_last_seq(self, key: str, seq: int) -> None:
+        """更新某 key 的轮询水位(重启后续传,不重复推送)。"""
         with self._lock:
-            entry = self._data.get(str(user_id))
+            entry = self._data.get(key)
             if not entry:
                 return  # 没绑 session,不存孤立水位
             entry["last_seq"] = seq
             entry["updated_at"] = int(time.time())
             self._save()
 
-    def reset(self, user_id: int) -> None:
-        """清空某用户的 session(下次消息会开新会话)。"""
+    def reset(self, key: str) -> None:
+        """清空某 key 的 session(下次消息会开新会话)。"""
         with self._lock:
-            self._data.pop(str(user_id), None)
+            self._data.pop(key, None)
             self._save()

@@ -56,8 +56,8 @@ class ZCodeTelegramBot:
             cli_path=config.zcode_cli_path or None,
         )
         self._zcode_lock = asyncio.Lock()
-        # user_id → Telegram chat_id:轮询发现 TUI 活动时,知道往哪推
-        self._user_chats: dict[int, int] = {}
+        # session key → (chat_id, thread_id):轮询发现 TUI 活动时,知道往哪推
+        self._push_targets: dict[str, tuple[int, Optional[int]]] = {}
         # session_id → asyncio.Lock:群组共享 session 时,串行化同 session 的 prompt(排队)
         self._session_locks: dict[str, asyncio.Lock] = {}
         # 缓存 bot 自己的 user id + username(用于检测"回复 bot"和"@本bot")
@@ -126,15 +126,45 @@ class ZCodeTelegramBot:
         user = update.effective_user
         return bool(user and user.id in self.config.allowed_users)
 
-    def _session_key(self, update: Update) -> int:
+    def _session_key(self, update: Update) -> str:
         """session 归属的 key。
 
-        群组:用 chat_id(群内共享一个 session);
+        论坛群的话题:用 "chat_id:thread_id"(每话题独立 session);
+        普通群(没开话题):用 chat_id(群内共享);
         私聊:用 user_id(每用户独立)。
         """
-        if self._is_group(update):
-            return update.effective_chat.id
-        return update.effective_user.id
+        chat = update.effective_chat
+        if chat and self._is_group(update):
+            chat_id = chat.id
+            # 论坛群:按话题粒度分 session
+            if getattr(chat, "is_forum", False):
+                msg = update.effective_message
+                # 话题内消息有 message_thread_id;General 顶层消息可能为 None → 归到 General(thread_id=1)
+                thread_id = getattr(msg, "message_thread_id", None) if msg else None
+                if not thread_id:
+                    thread_id = 1  # General 话题
+                return f"{chat_id}:{thread_id}"
+            return str(chat_id)
+        return str(update.effective_user.id)
+
+    def _remember_push_target(self, update: Update) -> None:
+        """从 update 记录推送目标 (chat_id, thread_id),供轮询推送用。
+
+        论坛群按话题记 thread_id(General 顶层归 1);普通群/私聊 thread_id=None。
+        """
+        msg = update.effective_message
+        chat = update.effective_chat
+        if not msg or not chat or not msg.chat_id:
+            return
+        is_group = self._is_group(update)
+        thread_id = getattr(msg, "message_thread_id", None)
+        if is_group and getattr(chat, "is_forum", False):
+            if not thread_id:
+                thread_id = 1  # General 话题
+        else:
+            thread_id = None
+        key = self._session_key(update)
+        self._push_targets[key] = (msg.chat_id, thread_id)
 
     def _get_session_lock(self, session_id: str) -> asyncio.Lock:
         """取/建 per-session 的异步锁(群组共享 session 时排队用)。"""
@@ -168,6 +198,7 @@ class ZCodeTelegramBot:
                 )
                 await self.sync.client.subscribe(sid)
                 self.store.set(key, sid)
+                self._remember_push_target(update)
                 self._setup_watch(key, sid)
                 scope = "群组共享" if self._is_group(update) else "个人"
                 await update.message.reply_text(
@@ -223,6 +254,7 @@ class ZCodeTelegramBot:
         if not sid.startswith("sess_"):
             await update.message.reply_text("❌ sessionId 应以 `sess_` 开头。")
             return
+        self._remember_push_target(update)
         await self._do_sync(update, self._session_key(update), sid)
 
     async def on_session_pick(
@@ -237,6 +269,7 @@ class ZCodeTelegramBot:
             return
         sid = query.data.split("sync:", 1)[1]
         await query.edit_message_text(f"⏳ 关联 {sid[:20]}… 中")
+        self._remember_push_target(update)
         await self._do_sync(query, self._session_key(update), sid, edit=True)
 
     async def _do_sync(
@@ -267,10 +300,10 @@ class ZCodeTelegramBot:
         else:
             await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
-    def _setup_watch(self, key: int, sid: str) -> None:
+    def _setup_watch(self, key: str, sid: str) -> None:
         """为一个 session 建立 TUI→bot 轮询 watcher。
 
-        key 是 session 归属键(群组=chat_id,私聊=user_id)。
+        key 是 session 归属键(论坛话题="chat_id:thread_id";普通群=chat_id;私聊=user_id)。
         """
         if not self.sync:
             return
@@ -282,23 +315,21 @@ class ZCodeTelegramBot:
 
         self.sync.watch(sid, last_seq, on_events)
 
-    def _push_chat_id(self, key: int) -> Optional[int]:
-        """从 session key 推断推送目标的 chat_id。
+    def _push_target(self, key: str) -> Optional[tuple[int, Optional[int]]]:
+        """从 session key 拿推送目标 (chat_id, thread_id)。
 
-        群组:key 本身就是 chat_id(负数);
-        私聊:查 _user_chats[user_id]。
+        论坛话题/普通群/私聊 都从 _push_targets 查;查不到返回 None。
         """
-        if key < 0:
-            return key  # 群组 chat_id
-        return self._user_chats.get(key)
+        return self._push_targets.get(key)
 
     async def _push_tui_updates(
-        self, key: int, session_id: str, events: list
+        self, key: str, session_id: str, events: list
     ) -> None:
-        """轮询发现 TUI 新活动时,推送到对应会话(群或私聊)。"""
-        chat_id = self._push_chat_id(key)
-        if not chat_id:
+        """轮询发现 TUI 新活动时,推送到对应会话(群话题或私聊)。"""
+        target = self._push_target(key)
+        if not target:
             return
+        chat_id, thread_id = target
         # 汇总:把有意义的事件格式化成一条消息
         lines = ["📥 [TUI 端有新活动]"]
         for e in events:
@@ -323,7 +354,7 @@ class ZCodeTelegramBot:
                 if content:
                     lines.append(f"💬 [{role}] {_truncate(content, 200)}")
         try:
-            await ctx_safe_send(chat_id, "\n".join(lines))
+            await ctx_safe_send(chat_id, "\n".join(lines), message_thread_id=thread_id)
         except Exception:
             logger.exception("推送 TUI 更新失败")
 
@@ -337,17 +368,12 @@ class ZCodeTelegramBot:
 
         is_group = self._is_group(update)
 
-        # 群组:只有 @bot 提及 或 回复 bot 的消息才触发
-        # 注意:bot 若是群管理员,会收到所有消息,必须靠这个判断过滤
+        # 群组:所有非命令文本都触发(无需 @bot)
+        # 过滤其他 bot 发的消息,避免 bot 间互触发
         if is_group:
-            triggered, reason = await self._is_group_trigger(update, ctx)
-            if not triggered:
-                logger.info(
-                    "群消息未触发(忽略): user=%s text=%r",
-                    user.id, (msg.text or "")[:60],
-                )
-                return  # 群里普通消息(没 @ / 不是回复 bot)→ 静默忽略
-            logger.info("群消息触发: user=%s reason=%s", user.id, reason)
+            if user.is_bot:
+                return
+            logger.info("群消息触发: user=%s", user.id)
 
         # 鉴权(双轨)
         if not self._is_allowed(update):
@@ -365,9 +391,8 @@ class ZCodeTelegramBot:
         if not prompt:
             return
 
-        # 记录 chat_id(私聊轮询推送用;群组直接用 chat_id 作为 key)
-        if msg.chat_id and not is_group:
-            self._user_chats[user.id] = msg.chat_id
+        # 记录推送目标(轮询发现 TUI 活动时,知道往哪个 chat/话题推)
+        self._remember_push_target(update)
 
         key = self._session_key(update)
         logger.info("user=%s chat=%s group=%s prompt=%r", user.id, msg.chat_id, is_group, prompt[:80])
@@ -559,7 +584,11 @@ class ZCodeTelegramBot:
     async def _handle_permission_event(
         self, update: Update, chat_id: int, placeholder, payload: dict
     ) -> None:
-        """收到 ZCode 的 permission.requested 事件 → 发 Telegram 审批按钮,等用户决策。"""
+        """收到 ZCode 的 permission.requested 事件 → 发 Telegram 审批按钮,等用户决策。
+
+        审批按钮用 send_message 发送,在论坛群里必须带 message_thread_id,
+        否则会落到 General 话题而不是当前话题。
+        """
         assert self.sync
         request_id = payload.get("request_id", "")
         tool_name = payload.get("tool_name", "工具")
@@ -589,8 +618,15 @@ class ZCodeTelegramBot:
         )
         app = _bot_ref.get("app")
         if app and app.bot:
+            # 论坛群:审批消息要落到当前话题,否则掉到 General
+            thread_id = None
+            chat = update.effective_chat
+            msg = update.effective_message
+            if chat and getattr(chat, "is_forum", False) and msg:
+                thread_id = getattr(msg, "message_thread_id", None) or 1
             await app.bot.send_message(
-                chat_id=chat_id, text=msg_text, reply_markup=InlineKeyboardMarkup(keyboard)
+                chat_id=chat_id, text=msg_text, message_thread_id=thread_id,
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
 
         # 等用户决策(不超时,符合需求)
@@ -697,10 +733,14 @@ def set_bot_instance(bot_app) -> None:
     _bot_ref["app"] = bot_app
 
 
-async def ctx_safe_send(chat_id: int, text: str) -> None:
+async def ctx_safe_send(
+    chat_id: int, text: str, message_thread_id: Optional[int] = None
+) -> None:
     app = _bot_ref.get("app")
     if app and app.bot:
-        await app.bot.send_message(chat_id=chat_id, text=text)
+        await app.bot.send_message(
+            chat_id=chat_id, text=text, message_thread_id=message_thread_id
+        )
 
 
 async def ctx_safe_edit(chat_id: int, message_id: int, text: str) -> None:
