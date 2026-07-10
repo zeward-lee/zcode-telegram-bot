@@ -113,7 +113,7 @@ class ZCodeClient:
             )
         except subprocess.TimeoutExpired as e:
             raise ZCodeTimeoutError(
-                f"zcode 调用超时({self.timeout}s)。prompt: {prompt[:80]!r}"
+                f"zcode 调用超时({self.timeout}s)。prompt_len={len(prompt)}"
             ) from e
 
         return self._parse_output(proc.returncode, proc.stdout, proc.stderr)

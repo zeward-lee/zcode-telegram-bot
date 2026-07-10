@@ -16,7 +16,7 @@ import time
 from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ParseMode
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -175,6 +175,8 @@ class ZCodeTelegramBot:
     # ---------- 命令 ----------
 
     async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_allowed(update):
+            return
         backend = "app-server(流式 + 双向同步)" if self.sync else "--prompt(回退)"
         await update.message.reply_text(
             "👋 你好!我是 ZCode Telegram Bot。\n\n"
@@ -197,6 +199,10 @@ class ZCodeTelegramBot:
                     self.config.workspace_path, mode=self.config.session_mode
                 )
                 await self.sync.client.subscribe(sid)
+                # 切新 session 前 unwatch 旧的,避免 watcher 堆积泄漏
+                old_sid = self.store.get(key)
+                if old_sid and old_sid != sid:
+                    self.sync.unwatch(old_sid)
                 self.store.set(key, sid)
                 self._remember_push_target(update)
                 self._setup_watch(key, sid)
@@ -211,6 +217,8 @@ class ZCodeTelegramBot:
             await update.message.reply_text("🔄 已开启新会话。下一条消息将从头开始。")
 
     async def cmd_id(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_allowed(update):
+            return
         user = update.effective_user
         if user:
             await update.message.reply_text(
@@ -284,6 +292,10 @@ class ZCodeTelegramBot:
             await self.sync.client.resume_session(sid)
             sub = await self.sync.client.subscribe(sid)
             last_seq = sub.get("eventSeq", 0)
+            # 切新 session 前 unwatch 旧的,避免 watcher 堆积泄漏
+            old_sid = self.store.get(key)
+            if old_sid and old_sid != sid:
+                self.sync.unwatch(old_sid)
             self.store.set(key, sid)
             self.store.set_last_seq(key, last_seq)
             self._setup_watch(key, sid)
@@ -395,7 +407,8 @@ class ZCodeTelegramBot:
         self._remember_push_target(update)
 
         key = self._session_key(update)
-        logger.info("user=%s chat=%s group=%s prompt=%r", user.id, msg.chat_id, is_group, prompt[:80])
+        # 日志只记 prompt 长度,不打内容(用户消息可能含密钥/敏感信息)
+        logger.info("user=%s chat=%s group=%s prompt_len=%d", user.id, msg.chat_id, is_group, len(prompt))
 
         if self.sync:
             await self._handle_app_server(update, key, prompt)
@@ -491,17 +504,42 @@ class ZCodeTelegramBot:
     async def _run_app_server_turn(
         self, update: Update, session_id: str, prompt: str
     ) -> None:
-        """单个 turn 的流式执行(在 session 锁内)。"""
+        """单个 turn 的流式执行(在 session 锁内)。
+
+        流式输出:边收 delta 边 edit 占位消息显示进度,turn 完成后短文本直接
+        把占位 edit 成最终结果(连贯、省一条消息),超长才删占位发多条。
+        期间持续发 typing 指示器,避免用户以为卡死。
+        """
         assert self.sync
         # 先发"思考中"占位
         placeholder = await update.message.reply_text("⏳ 思考中...")
         chat_id = placeholder.chat_id
+        thread_id = _thread_id_of(update)  # 论坛群话题,私聊/普通群为 None
 
         accumulated = ""
         last_edit = 0.0
+        last_typing = 0.0
         total_tokens = 0
         error = None
-        EDIT_MIN_INTERVAL = 2.0  # Telegram 同条消息 edit 限流
+        edit_interval = self.config.stream_edit_interval
+        app = _bot_ref.get("app")
+
+        async def _refresh_typing() -> None:
+            """续 typing 指示器(过期 5s,这里 4s 续一次)。"""
+            nonlocal last_typing
+            now = time.time()
+            if app and now - last_typing >= 4.0:
+                try:
+                    await app.bot.send_chat_action(
+                        chat_id=chat_id,
+                        action=ChatAction.TYPING,
+                        message_thread_id=thread_id,
+                    )
+                    last_typing = now
+                except Exception:
+                    pass
+
+        await _refresh_typing()  # 开头发一次
 
         try:
             async for ev in self.sync.send_stream(
@@ -516,11 +554,11 @@ class ZCodeTelegramBot:
                         accumulated += delta
                         # 节流 edit
                         now = time.time()
-                        if now - last_edit >= EDIT_MIN_INTERVAL and accumulated:
+                        if now - last_edit >= edit_interval and accumulated:
                             try:
                                 await ctx_safe_edit(
                                     chat_id, placeholder.message_id,
-                                    f"⏳ {accumulated}",
+                                    _truncate(accumulated, self.config.max_message_length - 8),
                                 )
                                 last_edit = now
                             except Exception:
@@ -536,6 +574,7 @@ class ZCodeTelegramBot:
                 elif ev.type == "permission.requested":
                     # build 模式:ZCode 请求审批写操作/命令 → 转发到 Telegram
                     await self._handle_permission_event(update, chat_id, placeholder, ev.payload)
+                await _refresh_typing()
                 # tool.updated 静默(避免刷屏);可在此追加展示
         except PromptAlreadyRunningError:
             await ctx_safe_edit(
@@ -565,19 +604,37 @@ class ZCodeTelegramBot:
                     fut.cancel()
             self._perm_futures.clear()
 
-        # 最终输出:删除占位,发完整结果(可能需要拆分)
+        # 最终输出:A1 短文本直接 edit 占位成最终内容(连贯、省一条);
+        #         超长才删占位 + 发多条(_send_chunked)
+        footer = f"\n\n_💎 {total_tokens} tokens_" if total_tokens else ""
+        max_single = self.config.max_message_length
+        final_text = accumulated if accumulated.strip() else "(ZCode 返回空内容)"
+
+        if error:
+            # 出错:删占位,单独发错误(避免占位上残留进度)
+            try:
+                await ctx_safe_delete(chat_id, placeholder.message_id)
+            except Exception:
+                pass
+            await update.message.reply_text(f"❌ {error}")
+            return
+
+        if len(final_text) + len(footer) <= max_single:
+            # 短文本:直接 edit 占位成最终结果
+            try:
+                await ctx_safe_edit(
+                    chat_id, placeholder.message_id, final_text + footer
+                )
+                return
+            except Exception:
+                # edit 失败(消息被删/权限等)→ fallback 发新消息
+                pass
+        # 超长或 edit 失败:删占位 + 拆分发多条
         try:
             await ctx_safe_delete(chat_id, placeholder.message_id)
         except Exception:
             pass
-
-        if error:
-            await update.message.reply_text(f"❌ {error}")
-            return
-        if not accumulated.strip():
-            accumulated = "(ZCode 返回空内容)"
-        footer = f"\n\n_💎 {total_tokens} tokens_" if total_tokens else ""
-        await self._send_chunked(update, accumulated, footer)
+        await self._send_chunked(update, final_text, footer)
 
     # ---------- permission 审批转发(build 模式)----------
 
@@ -619,11 +676,7 @@ class ZCodeTelegramBot:
         app = _bot_ref.get("app")
         if app and app.bot:
             # 论坛群:审批消息要落到当前话题,否则掉到 General
-            thread_id = None
-            chat = update.effective_chat
-            msg = update.effective_message
-            if chat and getattr(chat, "is_forum", False) and msg:
-                thread_id = getattr(msg, "message_thread_id", None) or 1
+            thread_id = _thread_id_of(update)
             await app.bot.send_message(
                 chat_id=chat_id, text=msg_text, message_thread_id=thread_id,
                 reply_markup=InlineKeyboardMarkup(keyboard)
@@ -825,6 +878,20 @@ def _format_perm_input(tool_name: str, input_data: dict) -> str:
 def _truncate(s: str, n: int) -> str:
     s = s.strip()
     return s if len(s) <= n else s[:n] + "…"
+
+
+def _thread_id_of(update: Update) -> Optional[int]:
+    """从 update 拿话题 message_thread_id。
+
+    论坛群的话题内消息有 thread_id(General 顶层为 None → 归 1);
+    普通群/私聊返回 None。用于 send_message / send_chat_action 落到正确话题。
+    """
+    chat = update.effective_chat
+    msg = update.effective_message
+    if chat and getattr(chat, "is_forum", False) and msg:
+        tid = getattr(msg, "message_thread_id", None)
+        return tid or 1  # General 话题
+    return None
 
 
 def _time_ago(ms_epoch: int) -> str:
