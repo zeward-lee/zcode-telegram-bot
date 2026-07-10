@@ -67,6 +67,8 @@ class ZCodeTelegramBot:
         self._perm_futures: dict[str, asyncio.Future] = {}
         # 正在跑的 turn:session_id → asyncio.Task(供 /cancel 取消)
         self._running_turns: dict[str, asyncio.Task] = {}
+        # /model 列表缓存:key → [(providerId, modelId, label), ...](callback_data 用索引,避免超 64 字节)
+        self._model_lists: dict[str, list[tuple[str, str, str]]] = {}
 
     # ---------- 应用装配 ----------
 
@@ -83,9 +85,11 @@ class ZCodeTelegramBot:
         app.add_handler(CommandHandler("id", self.cmd_id))
         app.add_handler(CommandHandler("sessions", self.cmd_sessions))
         app.add_handler(CommandHandler("sync", self.cmd_sync))
+        app.add_handler(CommandHandler("model", self.cmd_model))
         app.add_handler(CallbackQueryHandler(self.on_session_pick, pattern="^sync:"))
         app.add_handler(CallbackQueryHandler(self.on_permission_decision, pattern="^perm:"))
         app.add_handler(CallbackQueryHandler(self.on_cancel, pattern="^cancel:"))
+        app.add_handler(CallbackQueryHandler(self.on_model_pick, pattern="^model:"))
         app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_message)
         )
@@ -247,15 +251,50 @@ class ZCodeTelegramBot:
             "直接发消息给我,我会转发给 ZCode Agent 执行并返回结果。\n\n"
             f"后端:{backend}\n\n"
             "命令:\n"
-            "/new — 开启新会话\n"
+            "/new — 开启新会话(论坛群会创建新话题)\n"
             "/sessions — 列出本地 TUI session,选一个关联(双向同步)\n"
             "/sync <sessionId> — 直接关联指定 session\n"
+            "/model — 查看/切换当前会话模型\n"
             "/id — 查看你的 Telegram user id"
         )
 
     async def cmd_new(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_allowed(update):
             return
+        chat = update.effective_chat
+        is_forum_group = self._is_group(update) and getattr(chat, "is_forum", False)
+        # 论坛群:/new 创建新话题 + 新会话绑定(每话题独立会话)
+        if self.sync and is_forum_group:
+            name = (ctx.args[0] if ctx.args else "") or time.strftime("会话 %m-%d %H:%M")
+            try:
+                topic = await ctx.bot.create_forum_topic(chat_id=chat.id, name=name)
+                new_thread_id = topic.message_thread_id
+                sid = await self.sync.client.create_session(
+                    self.config.workspace_path, mode=self.config.session_mode
+                )
+                await self.sync.client.subscribe(sid)
+                new_key = f"{chat.id}:{new_thread_id}"
+                old_sid = self.store.get(new_key)
+                if old_sid and old_sid != sid:
+                    self.sync.unwatch(old_sid)
+                self.store.set(new_key, sid)
+                self._push_targets[new_key] = (chat.id, new_thread_id)
+                self.store.set_push_target(new_key, chat.id, new_thread_id)
+                self._setup_watch(new_key, sid)
+                await ctx.bot.send_message(
+                    chat_id=chat.id, message_thread_id=new_thread_id,
+                    text=(
+                        f"✅ 新话题已创建,新会话就绪:`{sid[:24]}…`\n"
+                        f"在这个话题里直接发消息即可(无需 @bot)。"
+                    ),
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except AppServerError as e:
+                await update.message.reply_text(f"❌ 创建会话失败: {e}")
+            except Exception as e:
+                await update.message.reply_text(f"❌ 创建话题失败: {e}")
+            return
+        # 非论坛群/私聊:在当前会话里重置
         key = self._session_key(update)
         if self.sync:
             try:
@@ -863,6 +902,107 @@ class ZCodeTelegramBot:
             pass
         task.cancel()
         logger.info("用户取消 turn(sessionId=%s)", sid)
+
+    async def cmd_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """查看/切换当前会话模型:列出可用模型按钮,点选切换。"""
+        if not self._is_allowed(update):
+            return
+        if not self.sync:
+            await update.message.reply_text("❌ 当前为 --prompt 回退模式,不支持切模型。")
+            return
+        key = self._session_key(update)
+        sid = self.store.get(key)
+        if not sid:
+            await update.message.reply_text("❓ 还没有会话,先发条消息或 /new 建一个。")
+            return
+        # 有 turn 在跑时不让切(避免打断)
+        running = self._running_turns.get(sid)
+        if running and not running.done():
+            await update.message.reply_text("⏳ 当前有任务在跑,完成后再切模型。")
+            return
+        try:
+            models = await self.sync.client.list_available_models()
+        except AppServerError as e:
+            await update.message.reply_text(f"❌ 读取模型列表失败: {e}")
+            return
+        if not models:
+            await update.message.reply_text("📭 没有可用模型。")
+            return
+        # 缓存列表(按钮用索引,避免 callback_data 超 64 字节)
+        items = []
+        for m in models:
+            ref = m.get("ref", {})
+            items.append((ref.get("providerId", ""), ref.get("modelId", ""),
+                          m.get("label", "") or f"{ref.get('providerId','')}/{ref.get('modelId','')}"))
+        self._model_lists[key] = items
+        # 渲染键盘
+        keyboard = []
+        for i, (_pid, _mid, label) in enumerate(items):
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"model:{i}")])
+        await update.message.reply_text(
+            "选择要切换的模型:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+    async def on_model_pick(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """模型列表按钮回调:点选后切换当前会话模型。"""
+        query = update.callback_query
+        await query.answer()
+        if not self._is_allowed(update):
+            await query.edit_message_text("🔒 无权操作。")
+            return
+        # 解析 callback_data: model:<idx>
+        idx_str = query.data.split(":", 1)[1] if ":" in query.data else ""
+        key = self._session_key(update)
+        items = self._model_lists.get(key)
+        try:
+            idx = int(idx_str)
+        except (ValueError, TypeError):
+            idx = -1
+        if not items or idx < 0 or idx >= len(items):
+            await query.edit_message_text("⚠️ 该列表已过期,请重新 /model。")
+            return
+        provider_id, model_id, label = items[idx]
+        sid = self.store.get(key)
+        if not sid:
+            await query.edit_message_text("⚠️ 当前没有会话,先 /new。")
+            return
+        # 有 turn 在跑时拒绝
+        running = self._running_turns.get(sid)
+        if running and not running.done():
+            await query.edit_message_text("⏳ 当前有任务在跑,完成后再切。")
+            return
+        await query.edit_message_text(f"⏳ 切换到 {label}…")
+        await self._do_set_model(update, key, sid, provider_id, model_id, label)
+
+    async def _do_set_model(
+        self, update, key: str, sid: str,
+        provider_id: str, model_id: str, label: str, edit: bool = True
+    ) -> None:
+        """在 session 锁内切换模型,成功回 ✅,失败回错误。"""
+        assert self.sync
+        lock = self._get_session_lock(sid)
+        msg = ""
+        async with lock:
+            try:
+                snap = await self.sync.client.set_session_model(sid, provider_id, model_id)
+                # 从快照确认新模型
+                new_model = (snap.get("session", {}).get("model") or {})
+                if new_model:
+                    label = new_model.get("modelId") or label
+                msg = f"✅ 模型已切换:`{label}`"
+            except AppServerError as e:
+                msg = f"❌ 切换失败: {e}"
+            except Exception as e:
+                msg = f"❌ 切换失败: {e}"
+        # 清掉列表缓存(切完失效)
+        self._model_lists.pop(key, None)
+        if edit:
+            await update.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
     async def _handle_prompt_mode(
         self, update: Update, key: int, prompt: str

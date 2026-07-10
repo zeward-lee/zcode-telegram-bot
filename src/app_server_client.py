@@ -485,10 +485,9 @@ class AppServerClient:
         return snap
 
     async def _build_current_runtime_model(self) -> Optional[dict]:
-        """从 workspace catalog + cli config 构造当前可用的 runtimeModel。
+        """构造当前可用的 runtimeModel(取 catalog available[0])。
 
         用于绕过旧 session 的 restoreWarning(模型 runtime revision 不匹配)。
-        返回 {revision, generatedAt, model, provider} 或 None(失败时)。
         """
         try:
             cat = await self._read_model_catalog()
@@ -496,26 +495,93 @@ class AppServerClient:
                 return None
             avail = cat["available"][0]
             ref = avail["ref"]
-            prov_id = ref["providerId"]
-            # 从 catalog 取 provider 骨架
-            prov = None
-            for p in cat.get("providers", []):
-                if p.get("providerId") == prov_id:
-                    prov = dict(p)
-                    break
-            if not prov:
-                return None
-            # 补 baseURL + apiKey(catalog 里被省略,从 cli config 读)
-            self._enrich_provider_from_config(prov, prov_id)
-            return {
-                "revision": str(cat.get("revision", 0)),  # revision 要 string
-                "generatedAt": 0,
-                "model": {"providerId": prov_id, "modelId": ref["modelId"]},
-                "provider": prov,
-            }
+            return await self._build_runtime_model_for(
+                ref["providerId"], ref["modelId"], cat=cat
+            )
         except Exception:
             logger.exception("构造 runtimeModel 失败")
             return None
+
+    async def _build_runtime_model_for(
+        self,
+        provider_id: str,
+        model_id: str,
+        cat: Optional[dict] = None,
+    ) -> Optional[dict]:
+        """按指定 (providerId, modelId) 构造 runtimeModel。
+
+        在 catalog available[] 里找匹配 ref,从 providers[] 取骨架,
+        pop 掉 catalog 独有的 apiKeyRef/disabledReason/updatedAt(yve strict 会拒),
+        再从 cli config 补 baseURL/apiKey/kind。返回 {revision,generatedAt,model,provider}。
+        """
+        if cat is None:
+            cat = await self._read_model_catalog()
+        if not cat or not cat.get("available"):
+            return None
+        # 找匹配的 available 项
+        avail = next(
+            (a for a in cat["available"]
+             if a.get("ref", {}).get("providerId") == provider_id
+             and a.get("ref", {}).get("modelId") == model_id),
+            None,
+        )
+        if not avail:
+            return None
+        # 从 catalog 取 provider 骨架
+        prov = None
+        for p in cat.get("providers", []):
+            if p.get("providerId") == provider_id:
+                prov = dict(p)
+                break
+        if not prov:
+            return None
+        # ★ 过滤 catalog 独有字段(runtimeModel.provider 用 yve strict,不认这些)
+        for k in ("apiKeyRef", "disabledReason", "updatedAt"):
+            prov.pop(k, None)
+        # 补 baseURL + apiKey + kind(从 cli config 读)
+        self._enrich_provider_from_config(prov, provider_id)
+        return {
+            "revision": str(cat.get("revision", 0)),  # revision 要 string
+            "generatedAt": 0,
+            "model": {"providerId": provider_id, "modelId": model_id},
+            "provider": prov,
+        }
+
+    async def list_available_models(self) -> list[dict]:
+        """列出当前 workspace 可选模型(给用户选)。
+
+        返回 catalog.available[](每条含 ref:{providerId,modelId}, label, ...),
+        过滤掉 provider disabledReason 非空的(禁用的不列)。
+        """
+        cat = await self._read_model_catalog()
+        if not cat:
+            return []
+        disabled_providers = {
+            p.get("providerId")
+            for p in cat.get("providers", [])
+            if p.get("disabledReason")
+        }
+        return [
+            a for a in cat.get("available", [])
+            if a.get("ref", {}).get("providerId") not in disabled_providers
+        ]
+
+    async def set_session_model(
+        self, session_id: str, provider_id: str, model_id: str
+    ) -> dict:
+        """切换当前 session 的模型(session/setModel)。
+
+        返回 session 快照,result["session"]["model"] 是新模型。
+        先构造 runtimeModel(强制 provider 配置),失败则只传 model ref。
+        """
+        params = {
+            "sessionId": session_id,
+            "model": {"providerId": provider_id, "modelId": model_id},
+        }
+        rm = await self._build_runtime_model_for(provider_id, model_id)
+        if rm:
+            params["runtimeModel"] = rm
+        return await self.request("session/setModel", params)
 
     async def _read_model_catalog(self) -> dict:
         """读当前 workspace 的模型目录(workspace/readState)。"""
