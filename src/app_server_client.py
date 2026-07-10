@@ -125,6 +125,8 @@ class AppServerClient:
             self._loop = asyncio.get_running_loop()
             args = self._build_args()
             logger.info("启动 app-server: %s (cwd=%s)", " ".join(args[:2]) + " ...", self.cwd)
+            # Windows 下 node.exe 是控制台程序,不设 CREATE_NO_WINDOW 会弹黑窗
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             self._proc = subprocess.Popen(
                 args,
                 cwd=self.cwd,
@@ -133,6 +135,7 @@ class AppServerClient:
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,  # 行缓冲
+                creationflags=creationflags,
             )
             self._started = True
             # 后台线程:逐行读 stdout,塞进 asyncio.Queue

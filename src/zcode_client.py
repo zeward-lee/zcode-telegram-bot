@@ -101,12 +101,15 @@ class ZCodeClient:
         work_dir = cwd or self.working_dir
 
         try:
+            # Windows 下 node.exe 是控制台程序,不设 CREATE_NO_WINDOW 会弹黑窗
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             proc = subprocess.run(
                 args,
                 cwd=work_dir,
                 capture_output=True,
                 text=True,
                 timeout=self.timeout,
+                creationflags=creationflags,
             )
         except subprocess.TimeoutExpired as e:
             raise ZCodeTimeoutError(
