@@ -732,7 +732,7 @@ class ZCodeTelegramBot:
 
         # 最终输出:A1 短文本直接 edit 占位成最终内容(连贯、省一条);
         #         超长才删占位 + 发多条(_send_chunked)
-        footer = f"\n\n_💎 {total_tokens} tokens_" if total_tokens else ""
+        footer = _build_footer(total_tokens, self.config.workspace_path)
         max_single = self.config.max_message_length
         final_text = accumulated if accumulated.strip() else "(ZCode 返回空内容)"
 
@@ -1065,7 +1065,7 @@ class ZCodeTelegramBot:
             await processing.delete()
         except Exception:
             pass
-        footer = f"\n\n_💎 {result.total_tokens} tokens_"
+        footer = _build_footer(result.total_tokens, self.config.workspace_path)
         await self._send_chunked(update, result.response.strip(), footer)
 
     async def _call_zcode(self, prompt: str, session_id: Optional[str]):
@@ -1206,6 +1206,16 @@ def _format_perm_input(tool_name: str, input_data: dict) -> str:
 def _truncate(s: str, n: int) -> str:
     s = s.strip()
     return s if len(s) <= n else s[:n] + "…"
+
+
+def _build_footer(total_tokens: int, workspace: str) -> str:
+    """构造消息末尾的元信息:token 数 + 工作区目录。"""
+    parts = []
+    if total_tokens:
+        parts.append(f"💎 {total_tokens} tokens")
+    if workspace:
+        parts.append(f"📁 {workspace}")
+    return "\n\n_" + " · ".join(parts) + "_" if parts else ""
 
 
 def _thread_id_of(update: Update) -> Optional[int]:
