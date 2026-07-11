@@ -583,6 +583,14 @@ class AppServerClient:
             params["runtimeModel"] = rm
         return await self.request("session/setModel", params)
 
+    async def stop_session(self, session_id: str) -> dict:
+        """停止 session 当前正在跑的 turn(session/stop)。
+
+        触发 app-server 的 activeAbortController.abort(),真正中断 turn
+        (不是 bot 侧 cancel task 只停渲染)。返回快照或抛 AppServerError。
+        """
+        return await self.request("session/stop", {"sessionId": session_id})
+
     async def _read_model_catalog(self) -> dict:
         """读当前 workspace 的模型目录(workspace/readState)。"""
         # workspace 用 app-server 的 cwd(即 self.cwd)

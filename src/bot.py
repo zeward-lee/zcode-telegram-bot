@@ -885,9 +885,8 @@ class ZCodeTelegramBot:
     ) -> None:
         """占位消息上"🚫 取消"按钮回调:取消正在跑的 turn。
 
-        先把该 turn 所有 pending permission 按 deny resolve(否则 ZCode 那边
-        permission 永等),再 cancel turn 的 Task。协议层无 turn.cancel,app-server
-        那边 turn 照跑完,但 bot 侧停止渲染 + 释放 session 锁。
+        先 stop_session 真正中断 app-server 那边的 turn(否则 session 还被占,
+        下条消息撞 -32010),再 resolve pending permission + cancel bot task。
         """
         query = update.callback_query
         await query.answer()
@@ -900,19 +899,23 @@ class ZCodeTelegramBot:
         if not task or task.done():
             await query.edit_message_text("⚠️ 该任务已结束,无需取消。")
             return
-        # 先 resolve 所有 pending permission 为 deny(共用 _resolve_perm)
+        # 先停 app-server 那边的 turn(否则 session 还被占,下条消息撞 -32010)
+        try:
+            await self.sync.client.stop_session(sid)
+        except Exception:
+            logger.warning("stop_session 失败(sessionId=%s),仍 cancel bot 侧 task", sid[:24])
+        # 再 resolve pending permission + cancel bot task
         for rid in list(self._perm_futures.keys()):
             await self._resolve_perm(rid, "deny", "用户取消了整个 turn")
-        # 占位的提示文案统一由 _run_app_server_turn 的 CancelledError 分支处理
         task.cancel()
         logger.info("用户取消 turn(sessionId=%s)", sid)
 
     async def cmd_stop(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """停止当前话题/会话正在跑的任务(/stop)。
 
-        跟占位上的"🚫 取消"按钮等价:先 resolve pending permission,
-        再 cancel turn 的 Task。占位消息由 _run_app_server_turn 的 CancelledError
-        分支 edit 成"已停止"。
+        先 stop_session 真正中断 app-server 那边的 turn(否则 session 还被占),
+        再 resolve pending permission + cancel bot task 停渲染释放锁。
+        占位消息由 _run_app_server_turn 的 CancelledError 分支 edit 成"已停止"。
         """
         if not self._is_allowed(update):
             return
@@ -925,7 +928,12 @@ class ZCodeTelegramBot:
         if not task or task.done():
             await update.message.reply_text("💤 当前没有在跑的任务。")
             return
-        # 先 resolve pending permission(否则 ZCode 那边 permission 永等)
+        # 先停 app-server 那边的 turn(否则 session 还被占,下条消息撞 -32010)
+        try:
+            await self.sync.client.stop_session(sid)
+        except Exception:
+            logger.warning("stop_session 失败(sessionId=%s),仍 cancel bot 侧 task", sid[:24])
+        # 再 resolve pending permission(否则 ZCode 那边 permission 永等)
         for rid in list(self._perm_futures.keys()):
             await self._resolve_perm(rid, "deny", "用户停止了任务")
         task.cancel()
